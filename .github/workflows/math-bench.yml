@@ -1,0 +1,85 @@
+name: Math approximation benchmark (macOS)
+
+on:
+  push:
+    branches: [bench-math]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: before
+            repo: kernelize-ai/triton-cpu
+            ref: 30b1eba432b5435edaf9f7ca9b0770bcf4447478
+          - variant: after
+            repo: niy-ati/triton-cpu
+            ref: vectorize-math-main
+    env:
+      TRITON_BUILD_WITH_CLANG_LLD: "TRUE"
+    steps:
+      - name: Checkout benchmark scripts
+        uses: actions/checkout@v4
+        with:
+          path: benchrepo
+      - name: Checkout triton-cpu (${{ matrix.variant }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.ref }}
+          path: plugin
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Checkout Triton
+        run: |
+          git clone --filter=blob:none https://github.com/triton-lang/triton.git triton
+          cd triton && git checkout -q "$(cat ../plugin/triton.txt)" && git submodule update --init --recursive -q
+          git apply -v ../plugin/.github/patches/*.patch
+      - name: Install brew dependencies
+        run: brew install ccache llvm@20 lld coreutils libomp boost
+      - name: Install torch and Triton
+        working-directory: ./triton
+        env:
+          TRITON_BUILD_WITH_O1: "true"
+          MAX_JOBS: 3
+        run: |
+          python3 -m venv ~/.venv && source ~/.venv/bin/activate
+          python -m pip install -q --upgrade pip
+          python -m pip install -q torch==2.9.0 --index-url https://download.pytorch.org/whl/test/cpu
+          python -m pip install -q pytest pytest-xdist numpy scipy
+          export PATH="/opt/homebrew/opt/llvm@20/bin:$PATH"
+          export CC=/opt/homebrew/opt/llvm@20/bin/clang CXX=/opt/homebrew/opt/llvm@20/bin/clang++
+          export CXXFLAGS="-stdlib=libc++" LDFLAGS="-L/opt/homebrew/opt/llvm@20/lib"
+          TRITON_PLUGIN_DIRS=${GITHUB_WORKSPACE}/plugin make dev-install
+      - name: Benchmarks (${{ matrix.variant }})
+        env:
+          TRITON_DEFAULT_BACKEND: cpu
+          MPLBACKEND: Agg
+        run: |
+          source ~/.venv/bin/activate
+          sysctl -n machdep.cpu.brand_string hw.ncpu || true
+          cd benchrepo/bench
+          for i in 1 2; do
+            TRITON_CPU_ENABLE_TILE_AND_FUSE=1 OMP_NUM_THREADS=1 python math_eval.py "${{ matrix.variant }} r$i"
+            TRITON_CPU_ENABLE_TILE_AND_FUSE=1 python softmax_bench.py "${{ matrix.variant }} r$i"
+          done
+      - name: Tests (${{ matrix.variant }})
+        if: matrix.variant == 'after'
+        working-directory: ./triton
+        env:
+          TRITON_DEFAULT_BACKEND: cpu
+        run: |
+          source ~/.venv/bin/activate
+          python -m pytest -q ../plugin/python/test/test_math_approximation.py
+          skip_expr=$(python3 -c "tests=[l.strip() for l in open('../plugin/test/filtered_test_list.txt') if l.strip()]; print(' or '.join(tests))")
+          for tf in 1 0; do
+            TRITON_CPU_ENABLE_TILE_AND_FUSE=$tf python -m pytest -q -n 3 --device cpu python/test/unit/language/test_core.py -k "(erf or math or exp or log or softmax or precise) and not (${skip_expr})" | tail -2
+          done
