@@ -23,4 +23,5 @@ add_triton_library(TritonCPUToLLVM
 
     LINK_LIBS PUBLIC
     MLIRArmSMEDialect
+    MLIRMathTransforms
 )

@@ -3,7 +3,10 @@
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Math/Transforms/Passes.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
 
@@ -54,8 +57,44 @@ public:
     addLegalOp<mlir::UnrealizedConversionCastOp>();
     addLegalOp<mlir::triton::cpu::MaskedLoadOp,
                mlir::triton::cpu::MaskedStoreOp>();
+    // Scalar transcendental functions may be expanded into polynomials after
+    // this conversion; see expandTranscendentals.
+    addDynamicallyLegalOp<math::ExpOp, math::LogOp, math::Log2Op, math::ErfOp>(
+        [](Operation *op) {
+          return !isa<RankedTensorType>(op->getResult(0).getType());
+        });
   }
 };
+
+// Expand scalar transcendental functions into polynomials of arithmetic ops
+// inside ttc.generic regions, where they vectorize: lowered as LLVM
+// intrinsics, each element becomes a libm call. Elsewhere the code stays
+// scalar and libm is faster, except for math.erf, which has no lowering.
+LogicalResult expandTranscendentals(ModuleOp mod,
+                                    LLVMTypeConverter &typeConverter) {
+  MLIRContext *context = mod.getContext();
+  SmallVector<Operation *> ops;
+  mod.walk([&](Operation *op) {
+    if (isa<math::ErfOp>(op) ||
+        (isa<math::ExpOp, math::LogOp, math::Log2Op>(op) &&
+         op->getParentOfType<triton::cpu::GenericOp>()))
+      ops.push_back(op);
+  });
+  RewritePatternSet approxPatterns(context);
+  mlir::populateMathPolynomialApproximationPatterns(
+      approxPatterns, [](StringRef name) {
+        return llvm::is_contained(
+            {"math.exp", "math.log", "math.log2", "math.erf"}, name);
+      });
+  if (failed(applyOpPatternsGreedily(ops, std::move(approxPatterns))))
+    return failure();
+
+  TritonLLVMFunctionConversionTarget target(*context);
+  RewritePatternSet patterns(context);
+  mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
+  mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
+  return applyPartialConversion(mod, target, std::move(patterns));
+}
 
 struct ConvertTritonCPUToLLVM
     : public triton::cpu::impl::ConvertTritonCPUToLLVMBase<
@@ -161,6 +200,9 @@ struct ConvertTritonCPUToLLVM
 
     TritonLLVMConversionTarget convTarget(*context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
+      return signalPassFailure();
+
+    if (failed(expandTranscendentals(mod, typeConverter)))
       return signalPassFailure();
 
     // Lower generic op to control flow separately to avoid breaking analysis.

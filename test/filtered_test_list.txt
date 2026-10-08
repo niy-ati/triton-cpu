@@ -1,6 +1,6 @@
 test_atomic_rmw
 test_tensor_atomic_rmw
-test_math_erf_op
+test_math_erf_op and float64
 test_tensor_atomic_add_access_patterns
 test_atomic_cas
 test_tensor_atomic_cas
